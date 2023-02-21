@@ -1,5 +1,6 @@
 from datetime import datetime
 
+import ray
 import torch
 from torch.utils.data import Dataset
 import pandas as pd
@@ -8,8 +9,15 @@ import numpy as np
 from tqdm import tqdm
 import spacy
 import time
+from ray import tune, air
+from ray.tune import Tuner, ExperimentAnalysis
+from ray.air import RunConfig
+from ray.tune.schedulers import ASHAScheduler
 
+from dataset import LiteralLinkPredDataset
 from models import DistMult, DistMultRegression
+import os
+from ray.tune import Tuner, ExperimentAnalysis, CLIReporter
 
 
 def negative_sampling(edge_index, num_nodes, eta=1):
@@ -27,106 +35,23 @@ def negative_sampling(edge_index, num_nodes, eta=1):
     return neg_edge_index
 
 
-class LiteralLinkPredDataset(Dataset):
+def train_standard_lp(config,
+                      model_lp,
+                      model_features,
+                      loss_function_model,
+                      loss_function_features,
+                      optimizer,
+                      dataset):
 
-    def __getitem__(self, index):
-        # placeholder
-        return None
-
-    def __init__(self, triple_file, literal_file, transform=None, target_transform=None):
-        print('start loading dataframes')
-        df_triples_train = pd.read_csv(osp.join(triple_file, 'train.txt'), header=None, sep='\t')
-        df_triples_val = pd.read_csv(osp.join(triple_file, 'valid.txt'), header=None, sep='\t')
-        df_triples_test = pd.read_csv(osp.join(triple_file, 'test.txt'), header=None, sep='\t')
-        df_literals_num = pd.read_csv(osp.join(triple_file, 'numerical_literals.txt'), header=None, sep='\t')
-        df_literals_txt = pd.read_csv(osp.join(triple_file, 'text_literals.txt'), header=None, sep='\t')
-
-        print('start loading relational data')
-        self.entities = list(set(np.concatenate([df_triples_train[0].unique(),
-                                                 df_triples_test[0].unique(),
-                                                 df_triples_val[0].unique(),
-                                                 df_triples_train[2].unique(),
-                                                 df_triples_test[2].unique(),
-                                                 df_triples_val[2].unique(),
-                                                 df_literals_num[0].unique(),
-                                                 df_literals_txt[0].unique()])))
-        self.num_entities = len(self.entities)
-
-        self.relations = list(set(np.concatenate([df_triples_train[1].unique(),
-                                                  df_triples_test[1].unique(),
-                                                  df_triples_val[1].unique()])))
-        self.num_relations = len(self.relations)
-
-        self.entity2id = {self.entities[i]: i for i in range(len(self.entities))}
-        self.relation2id = {self.relations[i]: i for i in range(len(self.relations))}
-
-        self.edge_index_train = torch.stack([torch.tensor(df_triples_train[0].map(self.entity2id)),
-                                             torch.tensor(df_triples_train[2].map(self.entity2id))])
-        self.edge_index_val = torch.stack([torch.tensor(df_triples_val[0].map(self.entity2id)),
-                                           torch.tensor(df_triples_val[2].map(self.entity2id))])
-        self.edge_index_test = torch.stack([torch.tensor(df_triples_test[0].map(self.entity2id)),
-                                            torch.tensor(df_triples_test[2].map(self.entity2id))])
-
-        self.edge_type_train = torch.tensor(df_triples_train[1].map(self.relation2id))
-        self.edge_type_val = torch.tensor(df_triples_val[1].map(self.relation2id))
-        self.edge_type_test = torch.tensor(df_triples_test[1].map(self.relation2id))
-
-        # with E = number of embeddings, R = number of attributive relations, V = feature dim
-        print('start loading numerical literals: E x R')
-        self.attr_relations_num = list(df_literals_num[1].unique())
-        self.attr_relation_2_id_num = {self.attr_relations_num[i]: i for i in range(len(self.attr_relations_num))}
-
-        df_literals_num[0] = df_literals_num[0].map(self.entity2id).astype(int)
-        df_literals_num[1] = df_literals_num[1].map(self.attr_relation_2_id_num).astype(int)
-        df_literals_num[2] = df_literals_num[2].astype(float)
-
-        self.num_attributive_relations_num = len(self.attr_relations_num)
-
-        self.features_num = []
-        for i in tqdm(range(len(self.entities))):
-            df_i = df_literals_num[df_literals_num[0] == i]
-
-            feature_i = torch.zeros(self.num_attributive_relations_num)
-            for index, row in df_i.iterrows():
-                feature_i[int(row[1])] = float(row[2])
-
-            self.features_num.append(feature_i)
-        self.features_num = torch.stack(self.features_num)
-
-        max_lit, min_lit = torch.max(self.features_num, dim=0).values, torch.min(self.features_num, dim=0).values
-
-        self.features_num = (self.features_num - min_lit) / (max_lit - min_lit + 1e-8)
-
-        print('start loading textual literals: E x R x V')
-        self.attr_relations_txt = list(df_literals_txt[1].unique())
-        self.attr_relation_2_id_txt = {self.attr_relations_txt[i]: i for i in range(len(self.attr_relations_txt))}
-
-        df_literals_txt[0] = df_literals_txt[0].map(self.entity2id).astype(int)
-        df_literals_txt[1] = df_literals_txt[1].map(self.attr_relation_2_id_txt).astype(int)
-        df_literals_num[2] = df_literals_num[2].astype(str)
-        self.num_attributive_relations_txt = len(self.attr_relations_txt)
-        nlp = spacy.load('en_core_web_md')
-
-        self.features_txt = []
-        for i in tqdm(range(len(self.entities))):
-            df_i = df_literals_txt[df_literals_txt[0] == i]
-
-            features_txt_i = torch.zeros(self.num_attributive_relations_txt, 300)
-            for index, row in df_i.iterrows():
-                spacy_sentence = torch.tensor(nlp(row[2]).vector)
-                features_txt_i[int(row[1])] = spacy_sentence
-
-            self.features_txt.append(features_txt_i)
-
-        self.features_txt = torch.stack(self.features_txt)
-
-
-def train_standard_lp(eta=2, regularization=False, literal_features_alpha=0.05):
-    model.train()
+    model_lp.train()
     start = time.time()
 
-    edge_index_batches = torch.split(train_edge_index_t, 1000)
-    edge_type_batches = torch.split(train_edge_type, 1000)
+    train_edge_index_t = dataset.edge_index_train.t().to(DEVICE)
+    train_edge_type = dataset.edge_type_train.to(DEVICE)
+    features_num = dataset.features_num.to(DEVICE)
+
+    edge_index_batches = torch.split(train_edge_index_t, config['batch_size'])
+    edge_type_batches = torch.split(train_edge_type, config['batch_size'])
 
     indices = np.arange(len(edge_index_batches))
     np.random.shuffle(indices)
@@ -136,30 +61,42 @@ def train_standard_lp(eta=2, regularization=False, literal_features_alpha=0.05):
         edge_idxs, relation_idx = edge_index_batches[i], edge_type_batches[i]
         optimizer.zero_grad()
 
-        edge_idxs_neg = negative_sampling(edge_idxs, dataset.num_entities, eta=eta)
+        edge_idxs_neg = negative_sampling(edge_idxs, dataset.num_entities, eta=config['eta'])
 
-        out_pos = model.forward(edge_idxs[:, 0], relation_idx, edge_idxs[:, 1])
-        out_neg = model.forward(edge_idxs_neg[:, 0], relation_idx.repeat(eta), edge_idxs_neg[:, 1])
+        out_pos = model_lp.forward(edge_idxs[:, 0], relation_idx, edge_idxs[:, 1])
+        out_neg = model_lp.forward(edge_idxs_neg[:, 0], relation_idx.repeat(config['eta']), edge_idxs_neg[:, 1])
 
         out = torch.cat([out_pos, out_neg], dim=0)
-        gt = torch.cat([torch.ones(len(relation_idx)), torch.zeros(len(relation_idx) * eta)], dim=0).to(DEVICE)
+        gt = torch.cat([torch.ones(len(relation_idx)), torch.zeros(len(relation_idx) * config['eta'])], dim=0).to(DEVICE)
 
         loss = loss_function_model(out, gt)
 
-        if regularization:
-               loss += 0.000001 * model.l3_regularization()
+        if config['reg']:
+            loss += 0.000001 * model_lp.l3_regularization()
 
-        if literal_features_alpha > 0:
+        if config['alpha'] > 0:
             batch_entities = torch.tensor(list(set(edge_idxs[:, 0].tolist() + edge_idxs[:, 1].tolist()))).to(DEVICE)
-            out = model_features.forward(model.entity(batch_entities))
-            feature_loss = loss_function_features(out, features_num[batch_entities])
-            loss = loss + literal_features_alpha * feature_loss
+            out = model_features.forward(model_lp.entity(batch_entities))
+            # print('before reshape', features_num[batch_entities].size())
+            gold_flatten = features_num[batch_entities].flatten()
+            # print('before filter:', gold_flatten.size())
+            relevant_idx = torch.nonzero(gold_flatten).flatten()
+            # print('after filter:', relevant_idx.size())
+
+            feature_loss = loss_function_features(out.flatten()[relevant_idx],
+                                                  features_num[batch_entities].flatten()[relevant_idx])
+            # filter loss according to this forum post:
+            # https://discuss.pytorch.org/t/does-loss-backword-work-if-i-filter-the-tensor-manually/125582
+            # print((1 - alpha) * loss)
+            # print(alpha * (100 * feature_loss))
+            # factor 100 for rescaling the regression loss
+            loss = (1 - config['alpha']) * loss + config['alpha'] * (100 * feature_loss)
 
         loss_total += loss
         loss.backward()
         optimizer.step()
     end = time.time()
-    print('esapsed time:', end - start)
+    print('elapsed time:', end - start)
     print('loss:', loss_total / len(edge_index_batches))
 
 
@@ -175,9 +112,9 @@ def compute_rank(ranks):
 
 
 @torch.no_grad()
-def compute_mrr_triple_scoring(model, eval_edge_index, eval_edge_type,
+def compute_mrr_triple_scoring(model_lp, dataset, eval_edge_index, eval_edge_type,
                                fast=False):
-    model.eval()
+    model_lp.eval()
     ranks = []
     num_samples = eval_edge_type.numel() if not fast else 5000
     for triple_index in tqdm(range(num_samples)):
@@ -197,7 +134,7 @@ def compute_mrr_triple_scoring(model, eval_edge_index, eval_edge_type,
         head = torch.full_like(tail, fill_value=src)
         eval_edge_typ_tensor = torch.full_like(tail, fill_value=rel).to(DEVICE)
 
-        out = model.forward(head.to(DEVICE), eval_edge_typ_tensor.to(DEVICE), tail.to(DEVICE))
+        out = model_lp.forward(head.to(DEVICE), eval_edge_typ_tensor.to(DEVICE), tail.to(DEVICE))
 
         rank = compute_rank(out)
         ranks.append(rank)
@@ -216,7 +153,7 @@ def compute_mrr_triple_scoring(model, eval_edge_index, eval_edge_type,
         tail = torch.full_like(head, fill_value=dst)
         eval_edge_typ_tensor = torch.full_like(head, fill_value=rel).to(DEVICE)
 
-        out = model.forward(head.to(DEVICE), eval_edge_typ_tensor.to(DEVICE), tail.to(DEVICE))
+        out = model_lp.forward(head.to(DEVICE), eval_edge_typ_tensor.to(DEVICE), tail.to(DEVICE))
 
         rank = compute_rank(out)
         ranks.append(rank)
@@ -231,48 +168,126 @@ def compute_mrr_triple_scoring(model, eval_edge_index, eval_edge_type,
            ranks[ranks <= 1].size(0) / num_ranks
 
 
-if __name__ == '__main__':
-    if not osp.isfile('./data/fb15k-237/processed.pt'):
-        dataset = LiteralLinkPredDataset('./data/fb15k-237', './literals.txt')
-        torch.save(dataset, './data/fb15k-237/processed.pt')
-    else:
-        dataset = torch.load('./data/fb15k-237/processed.pt')
+def train(config):
+    dataset = ray.get(dataset_ray)
+    #dataset = LiteralLinkPredDataset(osp.join(PROJECT_DIR, f'data/{dataset_name}'))
 
-    EMBEDDING_DIM = 200
-    DEVICE = torch.device('cuda')
-    lr = 0.0005
-    BATCH_SIZE = 128
-    run_name = 'feature_vs_objective_link_pred_' + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-    model = DistMult(dataset.num_entities, dataset.num_relations, EMBEDDING_DIM)
-    model.to(DEVICE)
-    model_features = DistMultRegression(EMBEDDING_DIM, dataset.num_attributive_relations_num)
+    model_lp = DistMult(dataset.num_entities, dataset.num_relations, config['dim'], config['dropout'],
+                        batch_norm=config['batch_norm'])
+    model_lp.to(DEVICE)
+    model_features = DistMultRegression(config['dim'], dataset.num_attributive_relations_num)
     model_features.to(DEVICE)
 
     loss_function_model = torch.nn.BCELoss()  # torch.nn.MSELoss()
-    loss_function_features = torch.nn.L1Loss(reduction='sum')
-    optimizer = torch.optim.Adam(list(model.parameters()) + list(model_features.parameters()), lr=0.0005)
-    model.train()
+    loss_function_features = torch.nn.L1Loss(reduction='mean')
+    if config['alpha'] > 0:
+        optimizer = torch.optim.Adam(list(model_lp.parameters()) + list(model_features.parameters()), lr=config['lr'])
+    else:
+        optimizer = torch.optim.Adam(model_lp.parameters(), lr=config['lr'])
+    model_lp.train()
     model_features.train()
 
-    train_edge_index_t = dataset.edge_index_train.t().to(DEVICE)
-    train_edge_type = dataset.edge_type_train.to(DEVICE)
-    features_num = dataset.features_num.to(DEVICE)
-
-    for epoch in range(0, 1000):
-        train_standard_lp(eta=1, literal_features_alpha=0)
+    for epoch in range(1, 1000):
+        train_standard_lp(config,
+                          model_lp,
+                          model_features,
+                          loss_function_model,
+                          loss_function_features,
+                          optimizer,
+                          dataset)
         if epoch % 50 == 0:
-            mrr, mr, hits10, hits5, hits3, hits1 = compute_mrr_triple_scoring(model,
+            mrr, mr, hits10, hits5, hits3, hits1 = compute_mrr_triple_scoring(model_lp,
+                                                                              dataset,
                                                                               dataset.edge_index_val,
                                                                               dataset.edge_type_val,
                                                                               fast=True)
             print('val mrr:', mrr, 'mr:', mr, 'hits@10:', hits10, 'hits@5:', hits5, 'hits@3:', hits3, 'hits@1:', hits1)
+            tune.report(mrr=mrr)
+            torch.save(model_lp.state_dict(), 'model_lp.pth')
+            torch.save(model_features.state_dict(), 'model_features.pth')
 
-    mrr, mr, hits10, hits5, hits3, hits1 = compute_mrr_triple_scoring(model,
+
+if __name__ == '__main__':
+    PROJECT_DIR = '/media/compute/homes/mblum/feature_vs_objective_link_pred'
+    resume_training_from = ''  # place a certain RUN_NAME here to resume
+    DEVICE = torch.device('cuda')
+    RUN_NAME = 'feature_vs_objective_link_pred_' + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    dataset_name = 'fb15k-237'
+    if not osp.isfile(osp.join(PROJECT_DIR, f'data/{dataset_name}/processed.pt')):
+        dataset = LiteralLinkPredDataset(osp.join(PROJECT_DIR, f'data/{dataset_name}'))
+        torch.save(dataset, osp.join(PROJECT_DIR, f'data/{dataset_name}/processed.pt'))
+    dataset = torch.load(osp.join(PROJECT_DIR, f'data/{dataset_name}/processed.pt'))
+
+    ray.init("auto")
+    dataset_ray = ray.put(dataset)
+
+    search_space = {
+        'dataset_name': 'fb15k-237',
+        'dim': tune.grid_search([100, 150, 200]),
+        "lr": tune.loguniform(1e-4, 1e-2),
+        "batch_size": tune.grid_search([128, 256, 1024]),  # 128 for completeness
+        'alpha': tune.uniform(0, 0.6),  # alpha of 0 leads to regular DistMult without literal features
+        'eta': tune.grid_search([1, 2, 5, 10, 15, 20]),
+        'reg': tune.grid_search([False]),
+        'batch_norm': tune.grid_search([True, False]),
+        'dropout': tune.grid_search([0, 0.1, 0.2, 0.3]),
+        "wandb": {"project": RUN_NAME, 'key': 'e9880ea37f0095828c07b36454127ef86fdc155e'}
+    }
+
+    # default config
+    #train(config={'dataset_name': dataset_name,
+    #              'dim': 200,
+    #              'lr': 0.001,
+    #              'batch_size': 128,
+    #              'dropout': 0.2,
+    #              'alpha': 0.1,
+    #              'eta': 5,
+    #              'reg': False,
+    #              'batch_norm': False})
+
+    if resume_training_from == '':
+        reporter = CLIReporter(max_progress_rows=10)
+        reporter.add_metric_column("mrr")
+
+        tuner = tune.Tuner(
+            tune.with_resources(
+                tune.with_parameters(train),
+                resources={"cpu": 2, "gpu": 0.5}
+            ),
+            tune_config=tune.TuneConfig(
+                scheduler=ASHAScheduler(metric="mrr", mode="max"),
+                num_samples=8,
+                reuse_actors=False,
+            ),
+            run_config=air.RunConfig(progress_reporter=reporter),
+            param_space=search_space,
+            _tuner_kwargs={"raise_on_failed_trial": True}
+        )
+    else:
+        run_name = resume_training_from.split('/')[-1]
+        tuner = Tuner.restore(resume_training_from, resume_unfinished=False)
+
+    tuner.fit()
+    analysis = ExperimentAnalysis(experiment_checkpoint_path=f'/home/mblum/ray_results/{RUN_NAME}')
+
+    # load the best performing model
+    best_run_name = analysis.get_best_logdir("mrr", mode="max")
+    state_dict = torch.load(os.path.join(best_run_name, "model_lp.pth"))
+    print('best config:', analysis.get_best_config("mean_accuracy", mode="max"))
+    print('best model file:', os.path.join(best_run_name, "model.pth"))
+    best_config = analysis.get_best_config("mrr", mode="max")
+    dataset = torch.load(osp.join(PROJECT_DIR, f'data/{dataset_name}/processed.pt'))
+    model_lp = DistMult(dataset.num_entities, dataset.num_relations, best_config['dim'], best_config['dropout'],
+                        batch_norm=best_config['batch_norm'])
+    model_lp.load_state_dict(state_dict)
+    model_lp.to(DEVICE)
+    results = {'config': best_config, 'date': time.strftime("%Y%m%d")}
+    print(results)
+
+    mrr, mr, hits10, hits5, hits3, hits1 = compute_mrr_triple_scoring(model_lp,
+                                                                      dataset,
                                                                       dataset.edge_index_test,
                                                                       dataset.edge_type_test,
                                                                       fast=True)
     print('test mrr:', mrr, 'mr:', mr, 'hits@10:', hits10, 'hits@5:', hits5, 'hits@3:', hits3, 'hits@1:', hits1)
-
-
-
