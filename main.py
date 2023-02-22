@@ -10,8 +10,11 @@ from tqdm import tqdm
 import spacy
 import time
 from ray import tune, air
-from ray.tune import Tuner, ExperimentAnalysis
-from ray.air import RunConfig
+
+import ray
+from ray import tune
+from ray.air import session
+from ray.air.checkpoint import Checkpoint
 from ray.tune.schedulers import ASHAScheduler
 
 from dataset import LiteralLinkPredDataset
@@ -77,32 +80,24 @@ def train_standard_lp(config,
         if config['alpha'] > 0:
             batch_entities = torch.tensor(list(set(edge_idxs[:, 0].tolist() + edge_idxs[:, 1].tolist()))).to(DEVICE)
             out = model_features.forward(model_lp.entity(batch_entities))
-            # print('before reshape', features_num[batch_entities].size())
             gold_flatten = features_num[batch_entities].flatten()
-            # print('before filter:', gold_flatten.size())
             relevant_idx = torch.nonzero(gold_flatten).flatten()
-            # print('after filter:', relevant_idx.size())
 
             feature_loss = loss_function_features(out.flatten()[relevant_idx],
                                                   features_num[batch_entities].flatten()[relevant_idx])
-            # filter loss according to this forum post:
-            # https://discuss.pytorch.org/t/does-loss-backword-work-if-i-filter-the-tensor-manually/125582
-            # print((1 - alpha) * loss)
-            # print(alpha * (100 * feature_loss))
-            # factor 100 for rescaling the regression loss
+
             loss = (1 - config['alpha']) * loss + config['alpha'] * (100 * feature_loss)
 
         loss_total += loss
         loss.backward()
         optimizer.step()
     end = time.time()
-    print('elapsed time:', end - start)
-    print('loss:', loss_total / len(edge_index_batches))
+    #print('elapsed time:', end - start)
+    #print('loss:', loss_total / len(edge_index_batches))
 
 
 @torch.no_grad()
 def compute_rank(ranks):
-    # print(ranks)
     # fair ranking prediction as the average
     # of optimistic and pessimistic ranking
     true = ranks[0]
@@ -117,7 +112,7 @@ def compute_mrr_triple_scoring(model_lp, dataset, eval_edge_index, eval_edge_typ
     model_lp.eval()
     ranks = []
     num_samples = eval_edge_type.numel() if not fast else 5000
-    for triple_index in tqdm(range(num_samples)):
+    for triple_index in range(num_samples):
         (src, dst), rel = eval_edge_index[:, triple_index], eval_edge_type[triple_index]
 
         # Try all nodes as tails, but delete true triplets:
@@ -184,10 +179,23 @@ def train(config):
         optimizer = torch.optim.Adam(list(model_lp.parameters()) + list(model_features.parameters()), lr=config['lr'])
     else:
         optimizer = torch.optim.Adam(model_lp.parameters(), lr=config['lr'])
+
+    start_epoch = 1
+    # restore a checkpoint
+    loaded_checkpoint = session.get_checkpoint()
+    if loaded_checkpoint:
+        with loaded_checkpoint.as_directory() as loaded_checkpoint_dir:
+            model_state_lp, model_state_features, optimizer_state, states = torch.load(os.path.join(loaded_checkpoint_dir, "checkpoint.pt"))
+        model_lp.load_state_dict(model_state_lp)
+        model_features.load_state_dict(model_state_features)
+        optimizer.load_state_dict(optimizer_state)
+        start_epoch = states['epoch']
+        print('restored checkpoint with old epoch state:', start_epoch)
+
     model_lp.train()
     model_features.train()
 
-    for epoch in range(1, 1000):
+    for epoch in range(start_epoch, 1000):
         train_standard_lp(config,
                           model_lp,
                           model_features,
@@ -201,15 +209,22 @@ def train(config):
                                                                               dataset.edge_index_val,
                                                                               dataset.edge_type_val,
                                                                               fast=True)
-            print('val mrr:', mrr, 'mr:', mr, 'hits@10:', hits10, 'hits@5:', hits5, 'hits@3:', hits3, 'hits@1:', hits1)
-            tune.report(mrr=mrr)
+            #print('val mrr:', mrr, 'mr:', mr, 'hits@10:', hits10, 'hits@5:', hits5, 'hits@3:', hits3, 'hits@1:', hits1)
             torch.save(model_lp.state_dict(), 'model_lp.pth')
             torch.save(model_features.state_dict(), 'model_features.pth')
+
+            os.makedirs("model_checkpoint", exist_ok=True)
+            torch.save(
+                (model_lp.state_dict(), model_features.state_dict(), optimizer.state_dict(), {"epoch": epoch}),
+                "model_checkpoint/checkpoint.pt")
+            checkpoint = Checkpoint.from_directory("model_checkpoint")
+            session.report({"mrr": mrr}, checkpoint=checkpoint)
 
 
 if __name__ == '__main__':
     PROJECT_DIR = '/media/compute/homes/mblum/feature_vs_objective_link_pred'
-    resume_training_from = ''  # place a certain RUN_NAME here to resume
+    # place ~/ray_results/RUN_NAME here to resume the called RUN_NAME e.g. ~/ray_results/train_2023-02-22_12-59-53
+    resume_training_from = ''
     DEVICE = torch.device('cuda')
     RUN_NAME = 'feature_vs_objective_link_pred_' + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -219,7 +234,7 @@ if __name__ == '__main__':
         torch.save(dataset, osp.join(PROJECT_DIR, f'data/{dataset_name}/processed.pt'))
     dataset = torch.load(osp.join(PROJECT_DIR, f'data/{dataset_name}/processed.pt'))
 
-    ray.init("auto")
+    ray.init("auto")  # just required for slurm workload management
     dataset_ray = ray.put(dataset)
 
     search_space = {
@@ -228,11 +243,10 @@ if __name__ == '__main__':
         "lr": tune.loguniform(1e-4, 1e-2),
         "batch_size": tune.grid_search([128, 256, 1024]),  # 128 for completeness
         'alpha': tune.uniform(0, 0.6),  # alpha of 0 leads to regular DistMult without literal features
-        'eta': tune.grid_search([1, 2, 5, 10, 15, 20]),
+        'eta': tune.grid_search([1, 2, 5, 10, 20]),
         'reg': tune.grid_search([False]),
         'batch_norm': tune.grid_search([True, False]),
-        'dropout': tune.grid_search([0, 0.1, 0.2, 0.3]),
-        "wandb": {"project": RUN_NAME, 'key': 'e9880ea37f0095828c07b36454127ef86fdc155e'}
+        'dropout': tune.grid_search([0, 0.1, 0.2])
     }
 
     # default config
@@ -253,20 +267,20 @@ if __name__ == '__main__':
         tuner = tune.Tuner(
             tune.with_resources(
                 tune.with_parameters(train),
-                resources={"cpu": 2, "gpu": 0.5}
+                resources={"cpu": 2, "gpu": 0.5}  # usually two trials can share a GPU, therefore, 0.5 is enough
             ),
             tune_config=tune.TuneConfig(
                 scheduler=ASHAScheduler(metric="mrr", mode="max"),
-                num_samples=8,
+                num_samples=6,
                 reuse_actors=False,
             ),
-            run_config=air.RunConfig(progress_reporter=reporter),
+            run_config=air.RunConfig(progress_reporter=reporter, name=RUN_NAME),
             param_space=search_space,
             _tuner_kwargs={"raise_on_failed_trial": True}
         )
     else:
         run_name = resume_training_from.split('/')[-1]
-        tuner = Tuner.restore(resume_training_from, resume_unfinished=False)
+        tuner = Tuner.restore(resume_training_from, resume_unfinished=True)
 
     tuner.fit()
     analysis = ExperimentAnalysis(experiment_checkpoint_path=f'/home/mblum/ray_results/{RUN_NAME}')
