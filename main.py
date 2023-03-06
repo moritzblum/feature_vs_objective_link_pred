@@ -9,10 +9,10 @@ import numpy as np
 from tqdm import tqdm
 import spacy
 import time
-from ray import tune, air
 
+from ray import tune, air
 import ray
-from ray import tune
+
 from ray.air import session
 from ray.air.checkpoint import Checkpoint
 from ray.tune.schedulers import ASHAScheduler
@@ -45,7 +45,6 @@ def train_standard_lp(config,
                       loss_function_features,
                       optimizer,
                       dataset):
-
     model_lp.train()
     start = time.time()
 
@@ -70,7 +69,8 @@ def train_standard_lp(config,
         out_neg = model_lp.forward(edge_idxs_neg[:, 0], relation_idx.repeat(config['eta']), edge_idxs_neg[:, 1])
 
         out = torch.cat([out_pos, out_neg], dim=0)
-        gt = torch.cat([torch.ones(len(relation_idx)), torch.zeros(len(relation_idx) * config['eta'])], dim=0).to(DEVICE)
+        gt = torch.cat([torch.ones(len(relation_idx)), torch.zeros(len(relation_idx) * config['eta'])], dim=0).to(
+            DEVICE)
 
         loss = loss_function_model(out, gt)
 
@@ -92,8 +92,8 @@ def train_standard_lp(config,
         loss.backward()
         optimizer.step()
     end = time.time()
-    #print('elapsed time:', end - start)
-    #print('loss:', loss_total / len(edge_index_batches))
+    # print('elapsed time:', end - start)
+    # print('loss:', loss_total / len(edge_index_batches))
 
 
 @torch.no_grad()
@@ -165,7 +165,7 @@ def compute_mrr_triple_scoring(model_lp, dataset, eval_edge_index, eval_edge_typ
 
 def train(config):
     dataset = ray.get(dataset_ray)
-    #dataset = LiteralLinkPredDataset(osp.join(PROJECT_DIR, f'data/{dataset_name}'))
+    # dataset = LiteralLinkPredDataset(osp.join(PROJECT_DIR, f'data/{dataset_name}'))
 
     model_lp = DistMult(dataset.num_entities, dataset.num_relations, config['dim'], config['dropout'],
                         batch_norm=config['batch_norm'])
@@ -185,7 +185,8 @@ def train(config):
     loaded_checkpoint = session.get_checkpoint()
     if loaded_checkpoint:
         with loaded_checkpoint.as_directory() as loaded_checkpoint_dir:
-            model_state_lp, model_state_features, optimizer_state, states = torch.load(os.path.join(loaded_checkpoint_dir, "checkpoint.pt"))
+            model_state_lp, model_state_features, optimizer_state, states = torch.load(
+                os.path.join(loaded_checkpoint_dir, "checkpoint.pt"))
         model_lp.load_state_dict(model_state_lp)
         model_features.load_state_dict(model_state_features)
         optimizer.load_state_dict(optimizer_state)
@@ -209,7 +210,7 @@ def train(config):
                                                                               dataset.edge_index_val,
                                                                               dataset.edge_type_val,
                                                                               fast=True)
-            #print('val mrr:', mrr, 'mr:', mr, 'hits@10:', hits10, 'hits@5:', hits5, 'hits@3:', hits3, 'hits@1:', hits1)
+            # print('val mrr:', mrr, 'mr:', mr, 'hits@10:', hits10, 'hits@5:', hits5, 'hits@3:', hits3, 'hits@1:', hits1)
             torch.save(model_lp.state_dict(), 'model_lp.pth')
             torch.save(model_features.state_dict(), 'model_features.pth')
 
@@ -218,13 +219,16 @@ def train(config):
                 (model_lp.state_dict(), model_features.state_dict(), optimizer.state_dict(), {"epoch": epoch}),
                 "model_checkpoint/checkpoint.pt")
             checkpoint = Checkpoint.from_directory("model_checkpoint")
-            session.report({"mrr": mrr}, checkpoint=checkpoint)
+            session.report(
+                {"mrr": mrr.item(), "mr": mr, "hits10": hits10, "hits5": hits5, "hits3": hits3, "hits1": hits1},
+                checkpoint=checkpoint)
+            # tune.report({"mrr": mrr.item()})
 
 
 if __name__ == '__main__':
     PROJECT_DIR = '/media/compute/homes/mblum/feature_vs_objective_link_pred'
     # place ~/ray_results/RUN_NAME here to resume the called RUN_NAME e.g. ~/ray_results/train_2023-02-22_12-59-53
-    resume_training_from = ''
+    resume_training_from = ''  # /media/compute/homes/mblum/ray_results/feature_vs_objective_link_pred_2023-02-23_10-36-24
     DEVICE = torch.device('cuda')
     RUN_NAME = 'feature_vs_objective_link_pred_' + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -250,7 +254,7 @@ if __name__ == '__main__':
     }
 
     # default config
-    #train(config={'dataset_name': dataset_name,
+    # train(config={'dataset_name': dataset_name,
     #              'dim': 200,
     #              'lr': 0.001,
     #              'batch_size': 128,
@@ -274,16 +278,20 @@ if __name__ == '__main__':
                 num_samples=6,
                 reuse_actors=False,
             ),
-            run_config=air.RunConfig(progress_reporter=reporter, name=RUN_NAME),
+            run_config=air.RunConfig(progress_reporter=reporter,
+                                     name=RUN_NAME,
+                                     checkpoint_config=air.CheckpointConfig(
+                                         checkpoint_score_attribute="mrr",
+                                         num_to_keep=5)),
             param_space=search_space,
             _tuner_kwargs={"raise_on_failed_trial": True}
         )
     else:
-        run_name = resume_training_from.split('/')[-1]
+        RUN_NAME = resume_training_from.split('/')[-1]
         tuner = Tuner.restore(resume_training_from, resume_unfinished=True)
 
     tuner.fit()
-    analysis = ExperimentAnalysis(experiment_checkpoint_path=f'/home/mblum/ray_results/{RUN_NAME}')
+    analysis = ExperimentAnalysis(experiment_checkpoint_path=f'/media/compute/homes/mblum/ray_results/{RUN_NAME}')
 
     # load the best performing model
     best_run_name = analysis.get_best_logdir("mrr", mode="max")
