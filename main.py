@@ -55,12 +55,12 @@ def train_standard_lp(config,
     edge_index_batches = torch.split(train_edge_index_t, config['batch_size'])
     edge_type_batches = torch.split(train_edge_type, config['batch_size'])
 
-    indices = np.arange(len(edge_index_batches))
-    np.random.shuffle(indices)
+    batch_indices = np.arange(len(edge_index_batches))
+    np.random.shuffle(batch_indices)
 
     loss_total = 0
-    for i in indices:
-        edge_idxs, relation_idx = edge_index_batches[i], edge_type_batches[i]
+    for batch_index in batch_indices:
+        edge_idxs, relation_idx = edge_index_batches[batch_index], edge_type_batches[batch_index]
         optimizer.zero_grad()
 
         edge_idxs_neg = negative_sampling(edge_idxs, dataset.num_entities, eta=config['eta'])
@@ -72,28 +72,35 @@ def train_standard_lp(config,
         gt = torch.cat([torch.ones(len(relation_idx)), torch.zeros(len(relation_idx) * config['eta'])], dim=0).to(
             DEVICE)
 
+        #print('size lp:', gt.size())
+
         loss = loss_function_model(out, gt)
 
         if config['reg']:
-            loss += 0.000001 * model_lp.l3_regularization()
+            loss += 1e-5 * model_lp.l3_regularization()
 
         if config['alpha'] > 0:
             batch_entities = torch.tensor(list(set(edge_idxs[:, 0].tolist() + edge_idxs[:, 1].tolist()))).to(DEVICE)
-            out = model_features.forward(model_lp.entity(batch_entities))
+            out_flatten = model_features.forward(model_lp.entity(batch_entities)).flatten()
             gold_flatten = features_num[batch_entities].flatten()
-            relevant_idx = torch.nonzero(gold_flatten).flatten()
+            # we only score triples that have an attribute value
+            relevant_idx_mask = dataset.features_num_mask.to(DEVICE)[batch_entities].flatten()
 
-            feature_loss = loss_function_features(out.flatten()[relevant_idx],
-                                                  features_num[batch_entities].flatten()[relevant_idx])
+            feature_loss = loss_function_features(out_flatten[relevant_idx_mask],
+                                                  gold_flatten[relevant_idx_mask])
 
+            #print('size feature:', out_flatten[relevant_idx_mask].size())
+
+            #print('loss', loss)
+            #print('feature_loss', feature_loss)
             loss = (1 - config['alpha']) * loss + config['alpha'] * (100 * feature_loss)
 
         loss_total += loss
         loss.backward()
         optimizer.step()
     end = time.time()
-    # print('elapsed time:', end - start)
-    # print('loss:', loss_total / len(edge_index_batches))
+    #print('elapsed time:', end - start)
+    #print('loss:', loss_total / len(edge_index_batches))
 
 
 @torch.no_grad()
@@ -163,9 +170,8 @@ def compute_mrr_triple_scoring(model_lp, dataset, eval_edge_index, eval_edge_typ
            ranks[ranks <= 1].size(0) / num_ranks
 
 
-def train(config):
+def train_lp_objective(config):
     dataset = ray.get(dataset_ray)
-    # dataset = LiteralLinkPredDataset(osp.join(PROJECT_DIR, f'data/{dataset_name}'))
 
     model_lp = DistMult(dataset.num_entities, dataset.num_relations, config['dim'], config['dropout'],
                         batch_norm=config['batch_norm'])
@@ -173,7 +179,7 @@ def train(config):
     model_features = DistMultRegression(config['dim'], dataset.num_attributive_relations_num)
     model_features.to(DEVICE)
 
-    loss_function_model = torch.nn.BCELoss()  # torch.nn.MSELoss()
+    loss_function_model = torch.nn.BCELoss(reduction='mean')
     loss_function_features = torch.nn.L1Loss(reduction='mean')
     if config['alpha'] > 0:
         optimizer = torch.optim.Adam(list(model_lp.parameters()) + list(model_features.parameters()), lr=config['lr'])
@@ -210,7 +216,7 @@ def train(config):
                                                                               dataset.edge_index_val,
                                                                               dataset.edge_type_val,
                                                                               fast=True)
-            # print('val mrr:', mrr, 'mr:', mr, 'hits@10:', hits10, 'hits@5:', hits5, 'hits@3:', hits3, 'hits@1:', hits1)
+            print('val mrr:', mrr, 'mr:', mr, 'hits@10:', hits10, 'hits@5:', hits5, 'hits@3:', hits3, 'hits@1:', hits1)
             torch.save(model_lp.state_dict(), 'model_lp.pth')
             torch.save(model_features.state_dict(), 'model_features.pth')
 
@@ -226,9 +232,9 @@ def train(config):
 
 
 if __name__ == '__main__':
-    PROJECT_DIR = '/media/compute/homes/mblum/feature_vs_objective_link_pred'
+    PROJECT_DIR = '/homes/mblum/feature_vs_objective_link_pred'
     # place ~/ray_results/RUN_NAME here to resume the called RUN_NAME e.g. ~/ray_results/train_2023-02-22_12-59-53
-    resume_training_from = ''  # /media/compute/homes/mblum/ray_results/feature_vs_objective_link_pred_2023-02-23_10-36-24
+    resume_training_from = ''  # /homes/mblum/ray_results/feature_vs_objective_link_pred_2023-02-23_10-36-24
     DEVICE = torch.device('cuda')
     RUN_NAME = 'feature_vs_objective_link_pred_' + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -236,33 +242,34 @@ if __name__ == '__main__':
     if not osp.isfile(osp.join(PROJECT_DIR, f'data/{dataset_name}/processed.pt')):
         dataset = LiteralLinkPredDataset(osp.join(PROJECT_DIR, f'data/{dataset_name}'))
         torch.save(dataset, osp.join(PROJECT_DIR, f'data/{dataset_name}/processed.pt'))
+    print('load processed dataset')
     dataset = torch.load(osp.join(PROJECT_DIR, f'data/{dataset_name}/processed.pt'))
 
-    ray.init("auto")  # just required for slurm workload management
+    # ray.init("auto")  # just required for slurm workload management otherwise causes error
     dataset_ray = ray.put(dataset)
 
-    search_space = {
-        'dataset_name': 'fb15k-237',
-        'dim': tune.grid_search([100, 150, 200]),
-        "lr": tune.loguniform(1e-4, 1e-2),
-        "batch_size": tune.grid_search([128, 256, 1024]),  # 128 for completeness
-        'alpha': tune.uniform(0, 0.6),  # alpha of 0 leads to regular DistMult without literal features
-        'eta': tune.grid_search([1, 2, 5, 10, 20]),
-        'reg': tune.grid_search([False]),
-        'batch_norm': tune.grid_search([True, False]),
-        'dropout': tune.grid_search([0, 0.1, 0.2])
-    }
+    # search_space = {
+    #    'dataset_name': dataset_name,
+    #    'dim': tune.grid_search([100, 150, 200]),
+    #    "lr": tune.loguniform(1e-4, 1e-2),
+    #    "batch_size": tune.grid_search([128, 256, 1024]),  # 128 for completeness
+    #    'alpha': tune.grid_search([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),  # alpha of 0 leads to regular DistMult without literal features
+    #    'eta': tune.grid_search([1, 2, 5, 10, 20]),
+    #    'reg': tune.grid_search([True, False]),
+    #    'batch_norm': tune.grid_search([True, False]),
+    #    'dropout': tune.grid_search([0, 0.1, 0.2])
+    # }
 
     # default config
-    # train(config={'dataset_name': dataset_name,
-    #              'dim': 200,
-    #              'lr': 0.001,
-    #              'batch_size': 128,
-    #              'dropout': 0.2,
-    #              'alpha': 0.1,
-    #              'eta': 5,
-    #              'reg': False,
-    #              'batch_norm': False})
+    train_lp_objective(config={'dataset_name': dataset_name,
+                               'dim': 200,
+                               'lr': 0.001,
+                               'batch_size': 256,
+                               'dropout': 0.2,
+                               'alpha': 0.4,
+                               'eta': 5,
+                               'reg': False,
+                               'batch_norm': False})
 
     if resume_training_from == '':
         reporter = CLIReporter(max_progress_rows=10)
@@ -270,8 +277,8 @@ if __name__ == '__main__':
 
         tuner = tune.Tuner(
             tune.with_resources(
-                tune.with_parameters(train),
-                resources={"cpu": 2, "gpu": 0.5}  # usually two trials can share a GPU, therefore, 0.5 is enough
+                tune.with_parameters(train_lp_objective),
+                resources={"cpu": 4, "gpu": 0.5}  # usually two trials can share a GPU, therefore, 0.5 is enough
             ),
             tune_config=tune.TuneConfig(
                 scheduler=ASHAScheduler(metric="mrr", mode="max"),
@@ -291,7 +298,7 @@ if __name__ == '__main__':
         tuner = Tuner.restore(resume_training_from, resume_unfinished=True)
 
     tuner.fit()
-    analysis = ExperimentAnalysis(experiment_checkpoint_path=f'/media/compute/homes/mblum/ray_results/{RUN_NAME}')
+    analysis = ExperimentAnalysis(experiment_checkpoint_path=f'/homes/mblum/ray_results/{RUN_NAME}')
 
     # load the best performing model
     best_run_name = analysis.get_best_logdir("mrr", mode="max")
