@@ -9,6 +9,7 @@ import numpy as np
 from tqdm import tqdm
 import spacy
 import time
+import matplotlib.pyplot as plt
 
 from ray import tune, air
 import ray
@@ -72,7 +73,7 @@ def train_standard_lp(config,
         gt = torch.cat([torch.ones(len(relation_idx)), torch.zeros(len(relation_idx) * config['eta'])], dim=0).to(
             DEVICE)
 
-        #print('size lp:', gt.size())
+        # print('size lp:', gt.size())
 
         loss = loss_function_model(out, gt)
 
@@ -89,18 +90,21 @@ def train_standard_lp(config,
             feature_loss = loss_function_features(out_flatten[relevant_idx_mask],
                                                   gold_flatten[relevant_idx_mask])
 
-            #print('size feature:', out_flatten[relevant_idx_mask].size())
+            # print('size feature:', out_flatten[relevant_idx_mask].size())
 
-            #print('loss', loss)
-            #print('feature_loss', feature_loss)
+            # print('loss', loss)
+            # print('feature_loss', feature_loss)
             loss = (1 - config['alpha']) * loss + config['alpha'] * (100 * feature_loss)
+            #print((1 - config['alpha']) * loss)
+            #print('vs')
+            #print((100 * feature_loss))
 
         loss_total += loss
         loss.backward()
         optimizer.step()
     end = time.time()
-    #print('elapsed time:', end - start)
-    #print('loss:', loss_total / len(edge_index_batches))
+    # print('elapsed time:', end - start)
+    # print('loss:', loss_total / len(edge_index_batches))
 
 
 @torch.no_grad()
@@ -162,15 +166,17 @@ def compute_mrr_triple_scoring(model_lp, dataset, eval_edge_index, eval_edge_typ
 
     num_ranks = len(ranks)
     ranks = torch.tensor(ranks, dtype=torch.float)
-    return (1. / ranks).mean(), \
-           ranks.mean(), \
-           ranks[ranks <= 10].size(0) / num_ranks, \
-           ranks[ranks <= 5].size(0) / num_ranks, \
-           ranks[ranks <= 3].size(0) / num_ranks, \
-           ranks[ranks <= 1].size(0) / num_ranks
+    return ((1. / ranks).mean(),
+            ranks.mean(),
+            ranks[ranks <= 10].size(0) / num_ranks,
+            ranks[ranks <= 5].size(0) / num_ranks,
+            ranks[ranks <= 3].size(0) / num_ranks,
+            ranks[ranks <= 1].size(0) / num_ranks,
+            ranks)
 
 
 def train_lp_objective(config):
+
     dataset = ray.get(dataset_ray)
 
     model_lp = DistMult(dataset.num_entities, dataset.num_relations, config['dim'], config['dropout'],
@@ -202,7 +208,7 @@ def train_lp_objective(config):
     model_lp.train()
     model_features.train()
 
-    for epoch in range(start_epoch, 1000):
+    for epoch in range(start_epoch, 4000):
         train_standard_lp(config,
                           model_lp,
                           model_features,
@@ -210,12 +216,12 @@ def train_lp_objective(config):
                           loss_function_features,
                           optimizer,
                           dataset)
-        if epoch % 50 == 0:
-            mrr, mr, hits10, hits5, hits3, hits1 = compute_mrr_triple_scoring(model_lp,
-                                                                              dataset,
-                                                                              dataset.edge_index_val,
-                                                                              dataset.edge_type_val,
-                                                                              fast=True)
+        if epoch % 100 == 0:
+            mrr, mr, hits10, hits5, hits3, hits1, _ = compute_mrr_triple_scoring(model_lp,
+                                                                                 dataset,
+                                                                                 dataset.edge_index_val,
+                                                                                 dataset.edge_type_val,
+                                                                                 fast=True)
             print('val mrr:', mrr, 'mr:', mr, 'hits@10:', hits10, 'hits@5:', hits5, 'hits@3:', hits3, 'hits@1:', hits1)
             torch.save(model_lp.state_dict(), 'model_lp.pth')
             torch.save(model_features.state_dict(), 'model_features.pth')
@@ -228,13 +234,13 @@ def train_lp_objective(config):
             session.report(
                 {"mrr": mrr.item(), "mr": mr, "hits10": hits10, "hits5": hits5, "hits3": hits3, "hits1": hits1},
                 checkpoint=checkpoint)
-            # tune.report({"mrr": mrr.item()})
+            session.report({"mrr": mrr.item()})
 
 
 if __name__ == '__main__':
     PROJECT_DIR = '/homes/mblum/feature_vs_objective_link_pred'
     # place ~/ray_results/RUN_NAME here to resume the called RUN_NAME e.g. ~/ray_results/train_2023-02-22_12-59-53
-    resume_training_from = ''  # /homes/mblum/ray_results/feature_vs_objective_link_pred_2023-02-23_10-36-24
+    resume_training_from = '' # '/homes/mblum/ray_results/feature_vs_objective_link_pred_2023-04-17_18-27-45'  # /homes/mblum/ray_results/feature_vs_objective_link_pred_2023-02-23_10-36-24
     DEVICE = torch.device('cuda')
     RUN_NAME = 'feature_vs_objective_link_pred_' + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -248,28 +254,37 @@ if __name__ == '__main__':
     # ray.init("auto")  # just required for slurm workload management otherwise causes error
     dataset_ray = ray.put(dataset)
 
-    # search_space = {
-    #    'dataset_name': dataset_name,
-    #    'dim': tune.grid_search([100, 150, 200]),
-    #    "lr": tune.loguniform(1e-4, 1e-2),
-    #    "batch_size": tune.grid_search([128, 256, 1024]),  # 128 for completeness
-    #    'alpha': tune.grid_search([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),  # alpha of 0 leads to regular DistMult without literal features
-    #    'eta': tune.grid_search([1, 2, 5, 10, 20]),
-    #    'reg': tune.grid_search([True, False]),
-    #    'batch_norm': tune.grid_search([True, False]),
-    #    'dropout': tune.grid_search([0, 0.1, 0.2])
-    # }
+    search_space = {
+        'dataset_name': dataset_name,
+        'dim': tune.grid_search([100, 150, 200]),
+        "lr": tune.loguniform(1e-4, 1e-2),
+        "batch_size": 256, #tune.grid_search([128, 256, 1024]),  # 128 for completeness
+        'alpha': tune.grid_search([0.005, 0.01, 0.05, 0.1, 0.15, 0.2]),  # alpha of 0 leads to regular DistMult without literal features
+        'eta': 100, #tune.grid_search([20, 50, 100]),
+        'reg': tune.grid_search([False]),
+        'batch_norm': tune.grid_search([False]),
+        'dropout': tune.grid_search([0.2])
+    }
+
+    # the two best configurations for fb15k-237 are:
+    #'dim': 200 / 100  / 100
+    #"lr": 0.000214511 / 0.00140198 / 0.000659815
+    #"batch_size": 128 / 1024 / 256
+    #'eta': 50 / 50 / 100
+    #'reg': false
+    #'batch_norm': false
+    #'dropout': 0.2
 
     # default config
-    train_lp_objective(config={'dataset_name': dataset_name,
-                               'dim': 200,
-                               'lr': 0.001,
-                               'batch_size': 256,
-                               'dropout': 0.2,
-                               'alpha': 0.4,
-                               'eta': 5,
-                               'reg': False,
-                               'batch_norm': False})
+    #train_lp_objective(config={'dataset_name': dataset_name,
+    #                          'dim': 200,
+    #                          'lr': 0.00005,
+    #                          'batch_size': 256,
+    #                          'dropout': 0.2,
+    #                          'alpha': 0.1,
+    #                          'eta': 100,
+    #                          'reg': False,
+    #                          'batch_norm': False})
 
     if resume_training_from == '':
         reporter = CLIReporter(max_progress_rows=10)
@@ -282,28 +297,29 @@ if __name__ == '__main__':
             ),
             tune_config=tune.TuneConfig(
                 scheduler=ASHAScheduler(metric="mrr", mode="max"),
-                num_samples=6,
+                num_samples=8,
                 reuse_actors=False,
             ),
             run_config=air.RunConfig(progress_reporter=reporter,
                                      name=RUN_NAME,
                                      checkpoint_config=air.CheckpointConfig(
                                          checkpoint_score_attribute="mrr",
-                                         num_to_keep=5)),
+                                         num_to_keep=1)),
             param_space=search_space,
             _tuner_kwargs={"raise_on_failed_trial": True}
         )
+        tuner.fit()
+        analysis = ExperimentAnalysis(experiment_checkpoint_path=f'/homes/mblum/ray_results/{RUN_NAME}')
     else:
         RUN_NAME = resume_training_from.split('/')[-1]
-        tuner = Tuner.restore(resume_training_from, resume_unfinished=True)
-
-    tuner.fit()
-    analysis = ExperimentAnalysis(experiment_checkpoint_path=f'/homes/mblum/ray_results/{RUN_NAME}')
+        tuner = Tuner.restore(resume_training_from, restart_errored=True)
+        tuner.fit()
+        analysis = ExperimentAnalysis(experiment_checkpoint_path=resume_training_from)
 
     # load the best performing model
     best_run_name = analysis.get_best_logdir("mrr", mode="max")
+    print('best config:', analysis.get_best_config("mrr", mode="max"))
     state_dict = torch.load(os.path.join(best_run_name, "model_lp.pth"))
-    print('best config:', analysis.get_best_config("mean_accuracy", mode="max"))
     print('best model file:', os.path.join(best_run_name, "model.pth"))
     best_config = analysis.get_best_config("mrr", mode="max")
     dataset = torch.load(osp.join(PROJECT_DIR, f'data/{dataset_name}/processed.pt'))
@@ -314,9 +330,12 @@ if __name__ == '__main__':
     results = {'config': best_config, 'date': time.strftime("%Y%m%d")}
     print(results)
 
-    mrr, mr, hits10, hits5, hits3, hits1 = compute_mrr_triple_scoring(model_lp,
-                                                                      dataset,
-                                                                      dataset.edge_index_test,
-                                                                      dataset.edge_type_test,
-                                                                      fast=True)
+    mrr, mr, hits10, hits5, hits3, hits1, ranks = compute_mrr_triple_scoring(model_lp,
+                                                                             dataset,
+                                                                             dataset.edge_index_test,
+                                                                             dataset.edge_type_test,
+                                                                             fast=False)
     print('test mrr:', mrr, 'mr:', mr, 'hits@10:', hits10, 'hits@5:', hits5, 'hits@3:', hits3, 'hits@1:', hits1)
+
+    plt.hist(ranks, bins=100)
+    plt.savefig(f'./data/plot_{RUN_NAME}.svg')
